@@ -57,6 +57,8 @@ class LlavaOneVision_ReKV(LlavaOnevisionForConditionalGeneration, Abstract_ReKV)
             out = self.language_model(input_ids=input_ids, use_cache=True, past_key_values=self.kv_cache)
             past_key_values = out.past_key_values  # Retrieved KV-Cache: L x 2 x (B, h, N, Dh)
 
+        self.capture_retrieval_logits()
+
         for layer_kv in self.kv_cache:  # reset to default
             layer_kv.reset_retrieval()
 

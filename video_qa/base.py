@@ -4,6 +4,7 @@ import json
 import os
 import math
 import argparse
+import csv
 
 import pandas as pd
 import torch
@@ -17,7 +18,15 @@ from transformers import (
 import logzero
 from logzero import logger
 
-from model import llava_onevision_rekv, video_llava_rekv, longva_rekv
+from model import llava_onevision_rekv, video_llava_rekv, qwen2_5_vl_rekv
+
+try:
+    from model import longva_rekv
+except ImportError as exc:
+    longva_rekv = None
+    LONGVA_IMPORT_ERROR = exc
+else:
+    LONGVA_IMPORT_ERROR = None
 
 
 MODELS = {
@@ -31,7 +40,11 @@ MODELS = {
         'load_func': llava_onevision_rekv.load_model,
         'model_class': LlavaOnevisionForConditionalGeneration,
         'processor_class': LlavaOnevisionProcessor,
-        'model_path': 'model_zoo/llava-onevision-qwen2-7b-ov-hf',
+        'model_path': '/mnt/models/llava_ov_7b-hf',
+    },
+    'qwen2_5_vl_7b': {
+        'load_func': qwen2_5_vl_rekv.load_model,
+        'model_path': '/mnt/models/qwen/Qwen2.5-VL-7B-Instruct',
     },
     'llava_ov_72b': {
         'load_func': llava_onevision_rekv.load_model,
@@ -46,7 +59,7 @@ MODELS = {
         'model_path': 'model_zoo/Video-LLaVA-7B-hf',
     },
     'longva_7b': {
-        'load_func': longva_rekv.load_model,
+        'load_func': (longva_rekv.load_model if longva_rekv is not None else None),
         'model_path': 'model_zoo/LongVA-7B',
     },
 }
@@ -56,7 +69,14 @@ class BaseVQA:
     def __init__(self, anno, save_dir, sample_fps,
                  qa_model, qa_processor=None,
                  num_chunks=None, chunk_idx=None,
-                 retrieve_size=64, chunk_size=1) -> None:
+                 retrieve_size=64, chunk_size=1,
+                 layer_retrieve_sizes=None,
+                 dynamic_retrieve_alpha=None,
+                 dynamic_retrieve_min_size=None,
+                 dynamic_retrieve_max_size=None,
+                 dynamic_retrieve_normalize='zscore_softmax',
+                 dynamic_retrieve_alphas=None,
+                 save_retrieval_logits=False) -> None:
         
         self.sample_fps = sample_fps
 
@@ -67,6 +87,12 @@ class BaseVQA:
         assert chunk_size <= retrieve_size, f'chunk_size: {chunk_size}, retrieve_size: {retrieve_size}'
         self.retrieve_size = retrieve_size
         self.chunk_size = chunk_size
+        self.layer_retrieve_sizes = layer_retrieve_sizes or ''
+        self.dynamic_retrieve_alpha = dynamic_retrieve_alpha
+        self.dynamic_retrieve_min_size = dynamic_retrieve_min_size
+        self.dynamic_retrieve_max_size = dynamic_retrieve_max_size
+        self.dynamic_retrieve_normalize = dynamic_retrieve_normalize
+        self.dynamic_retrieve_alphas = dynamic_retrieve_alphas or []
 
         self.num_chunks = num_chunks
         self.chunk_idx = chunk_idx
@@ -76,8 +102,18 @@ class BaseVQA:
         self.eval_grounding = 'temporal_windows' in anno[0]['conversations'][0]
 
         self.save_dir = save_dir
+        self._active_save_dir = save_dir
         self.choice_letters = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
         self.record = {(self.retrieve_size, self.chunk_size): []}
+        self.save_retrieval_logits = save_retrieval_logits
+        self.output_csv_path = os.path.join(self.save_dir, f'{self.num_chunks}_{self.chunk_idx}.csv')
+        self.stream_result_columns = [
+            'video_id', 'uid', 'question', 'choices', 'answer', 'correct_choice',
+            'pred_answer', 'pred_choice', 'qa_acc', 'task', 'retrieval_logits_path',
+            'retrieve_size', 'chunk_size', 'layer_retrieve_sizes',
+            'dynamic_retrieve_alpha', 'dynamic_retrieve_min_size',
+            'dynamic_retrieve_max_size', 'dynamic_retrieve_normalize',
+        ]
 
     def split_list(self, lst, n):
         """Split a list into n (roughly) equal-sized chunks"""
@@ -95,6 +131,34 @@ class BaseVQA:
         video = vr.get_batch(frame_idx).asnumpy()
         logger.debug(f'video shape: {video.shape}')
         return video
+
+    def _alpha_label(self, alpha):
+        return str(alpha).replace('.', 'p')
+
+    def get_alpha_save_dir(self, alpha):
+        return os.path.join(self.save_dir, f'alpha{self._alpha_label(alpha)}-{self.sample_fps}')
+
+    def set_active_dynamic_alpha(self, alpha):
+        alpha = float(alpha)
+        self.dynamic_retrieve_alpha = alpha
+        if hasattr(self.qa_model, 'set_dynamic_retrieval_alpha'):
+            self.qa_model.set_dynamic_retrieval_alpha(alpha)
+        if self.dynamic_retrieve_alphas:
+            self._active_save_dir = self.get_alpha_save_dir(alpha)
+            os.makedirs(self._active_save_dir, exist_ok=True)
+            self.output_csv_path = os.path.join(self._active_save_dir, f'{self.num_chunks}_{self.chunk_idx}.csv')
+
+    def prepare_output_files(self):
+        if self.dynamic_retrieve_alphas:
+            for alpha in self.dynamic_retrieve_alphas:
+                run_dir = self.get_alpha_save_dir(alpha)
+                os.makedirs(run_dir, exist_ok=True)
+                csv_path = os.path.join(run_dir, f'{self.num_chunks}_{self.chunk_idx}.csv')
+                if os.path.exists(csv_path):
+                    os.remove(csv_path)
+            return
+        if os.path.exists(self.output_csv_path):
+            os.remove(self.output_csv_path)
     
     def calc_recall_precision(self, gt_temporal_windows, retrieved_mask):
         total_intersection_length = 0.0
@@ -140,6 +204,30 @@ class BaseVQA:
         else:
             return s[0]
 
+    def append_record(self, row):
+        row['layer_retrieve_sizes'] = self.layer_retrieve_sizes
+        row['dynamic_retrieve_alpha'] = self.dynamic_retrieve_alpha
+        row['dynamic_retrieve_min_size'] = self.dynamic_retrieve_min_size
+        row['dynamic_retrieve_max_size'] = self.dynamic_retrieve_max_size
+        row['dynamic_retrieve_normalize'] = self.dynamic_retrieve_normalize
+        self.record[(self.retrieve_size, self.chunk_size)].append(row)
+
+        stream_row = {col: row.get(col, '') for col in self.stream_result_columns}
+        stream_row['retrieve_size'] = self.retrieve_size
+        stream_row['chunk_size'] = self.chunk_size
+        stream_row['layer_retrieve_sizes'] = self.layer_retrieve_sizes
+        stream_row['dynamic_retrieve_alpha'] = self.dynamic_retrieve_alpha
+        stream_row['dynamic_retrieve_min_size'] = self.dynamic_retrieve_min_size
+        stream_row['dynamic_retrieve_max_size'] = self.dynamic_retrieve_max_size
+        stream_row['dynamic_retrieve_normalize'] = self.dynamic_retrieve_normalize
+
+        file_exists = os.path.exists(self.output_csv_path)
+        with open(self.output_csv_path, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=self.stream_result_columns)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(stream_row)
+
     def video_open_qa(self, question, max_new_tokens=1024):
         pass
 
@@ -151,6 +239,7 @@ class BaseVQA:
         pass
 
     def analyze(self, debug=False):
+        self.prepare_output_files()
         video_annos = self.anno[:1] if debug else self.anno
         for video_sample in tqdm(video_annos):
             logger.debug(f'video_id: {video_sample["video_id"]}')
@@ -161,9 +250,92 @@ class BaseVQA:
             df = pd.DataFrame(dict_list)
             df['retrieve_size'] = retrieve_size
             df['chunk_size'] = chunk_size
+            if 'layer_retrieve_sizes' not in df.columns:
+                df['layer_retrieve_sizes'] = self.layer_retrieve_sizes
+            if 'dynamic_retrieve_alpha' not in df.columns:
+                df['dynamic_retrieve_alpha'] = self.dynamic_retrieve_alpha
+            if 'dynamic_retrieve_min_size' not in df.columns:
+                df['dynamic_retrieve_min_size'] = self.dynamic_retrieve_min_size
+            if 'dynamic_retrieve_max_size' not in df.columns:
+                df['dynamic_retrieve_max_size'] = self.dynamic_retrieve_max_size
+            if 'dynamic_retrieve_normalize' not in df.columns:
+                df['dynamic_retrieve_normalize'] = self.dynamic_retrieve_normalize
             dfs.append(df)
         final_df = pd.concat(dfs, ignore_index=True)
         final_df.to_csv(f'{self.save_dir}/{self.num_chunks}_{self.chunk_idx}.csv', index=False)
+
+
+def parse_layer_retrieve_sizes(spec, default_retrieve_size):
+    if spec is None or str(spec).strip() == '':
+        return None
+
+    topk = {'default': int(default_retrieve_size)}
+    for item in str(spec).split(','):
+        item = item.strip()
+        if not item:
+            continue
+        if ':' not in item:
+            raise argparse.ArgumentTypeError(
+                f"Invalid layer retrieve size item {item!r}; expected LAYER:RS or START-END:RS."
+            )
+        layer_part, value_part = item.split(':', 1)
+        value = int(value_part)
+        if value <= 0:
+            raise argparse.ArgumentTypeError(f"retrieve size must be positive, got {value}.")
+        if '-' in layer_part:
+            start, end = [int(piece) for piece in layer_part.split('-', 1)]
+            if end < start:
+                raise argparse.ArgumentTypeError(f"Invalid layer range {layer_part!r}.")
+            for layer_idx in range(start, end + 1):
+                topk[layer_idx] = value
+        else:
+            topk[int(layer_part)] = value
+    return topk
+
+
+def parse_dynamic_retrieve_alphas(spec):
+    if spec is None or str(spec).strip() == '':
+        return []
+    pieces = str(spec).replace(',', ' ').split()
+    alphas = [float(piece) for piece in pieces]
+    for alpha in alphas:
+        if not (0.0 < alpha <= 1.0):
+            raise argparse.ArgumentTypeError(f"dynamic alpha must be in (0, 1], got {alpha}.")
+    return alphas
+
+
+def build_dynamic_retrieve_policy(args):
+    if args.dynamic_retrieve_alpha is None:
+        return None
+
+    min_size = args.dynamic_retrieve_min_size
+    if min_size is None:
+        min_size = args.retrieve_chunk_size
+    max_size = args.dynamic_retrieve_max_size
+    if max_size is None:
+        max_size = args.retrieve_size
+
+    min_size = int(min_size)
+    max_size = int(max_size)
+    alpha = float(args.dynamic_retrieve_alpha)
+    if min_size <= 0 or max_size <= 0:
+        raise ValueError(f"dynamic retrieve sizes must be positive, got min={min_size}, max={max_size}.")
+    if min_size > max_size:
+        raise ValueError(f"dynamic min size {min_size} must be <= max size {max_size}.")
+    if not (0.0 < alpha <= 1.0):
+        raise ValueError(f"dynamic alpha must be in (0, 1], got {alpha}.")
+    if min_size % args.retrieve_chunk_size != 0 or max_size % args.retrieve_chunk_size != 0:
+        raise ValueError(
+            f"dynamic min/max sizes must be divisible by retrieve_chunk_size={args.retrieve_chunk_size}."
+        )
+
+    return {
+        'policy': 'mass_threshold',
+        'alpha': alpha,
+        'min_topk': min_size,
+        'max_topk': max_size,
+        'normalize': args.dynamic_retrieve_normalize,
+    }
 
 
 def str2bool(value):
@@ -188,8 +360,22 @@ def work(QA_CLASS):
     parser.add_argument("--model", type=str, default="llava_ov_7b")
     parser.add_argument("--n_local", type=int, default=15000)
     parser.add_argument("--retrieve_size", type=int, default=64)
+    parser.add_argument("--layer_retrieve_sizes", type=str, default=None,
+                        help="Optional comma-separated per-layer overrides, e.g. '5:64' or '4-5:64'.")
+    parser.add_argument("--dynamic_retrieve_alpha", type=float, default=None,
+                        help="Enable cumulative-mass dynamic retrieval with this alpha threshold.")
+    parser.add_argument("--dynamic_retrieve_alphas", type=str, default=None,
+                        help="Run multiple dynamic alpha values in one video-encoding pass, e.g. '0.2 0.25 0.3 0.35'.")
+    parser.add_argument("--dynamic_retrieve_min_size", type=int, default=None,
+                        help="Minimum number of blocks retrieved per layer when dynamic retrieval is enabled.")
+    parser.add_argument("--dynamic_retrieve_max_size", type=int, default=None,
+                        help="Maximum number of blocks retrieved per layer when dynamic retrieval is enabled. Defaults to --retrieve_size.")
+    parser.add_argument("--dynamic_retrieve_normalize", type=str, default='zscore_softmax',
+                        choices=['zscore_softmax', 'softmax', 'minmax_l1', 'relu_l1'],
+                        help="Normalization used before cumulative-mass dynamic retrieval.")
     parser.add_argument("--retrieve_chunk_size", type=int, default=1)
     parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=True)
+    parser.add_argument("--save_retrieval_logits", type=str2bool, nargs='?', const=True, default=False)
     args = parser.parse_args()
 
     if not args.debug:
@@ -197,6 +383,22 @@ def work(QA_CLASS):
         warnings.filterwarnings('ignore')
 
     os.makedirs(args.save_dir, exist_ok=True)
+    layer_retrieve_sizes = parse_layer_retrieve_sizes(args.layer_retrieve_sizes, args.retrieve_size)
+    try:
+        dynamic_retrieve_alphas = parse_dynamic_retrieve_alphas(args.dynamic_retrieve_alphas)
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
+    if dynamic_retrieve_alphas:
+        if args.dynamic_retrieve_alpha is not None:
+            parser.error("Use either --dynamic_retrieve_alpha or --dynamic_retrieve_alphas, not both.")
+        args.dynamic_retrieve_alpha = dynamic_retrieve_alphas[0]
+    try:
+        dynamic_retrieve_policy = build_dynamic_retrieve_policy(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if dynamic_retrieve_policy is not None and layer_retrieve_sizes is not None:
+        parser.error("--dynamic_retrieve_alpha and --layer_retrieve_sizes are currently mutually exclusive.")
+    retrieval_topk = dynamic_retrieve_policy or layer_retrieve_sizes or args.retrieve_size
 
     # fix random seed
     random.seed(2024)
@@ -205,11 +407,13 @@ def work(QA_CLASS):
     # VideoQA model
     model_path = MODELS[args.model]['model_path']
     load_func = MODELS[args.model]['load_func']
+    if load_func is None:
+        raise ImportError(f"Failed to import model backend for {args.model}: {LONGVA_IMPORT_ERROR}")
     logger.info(f"Loading VideoQA model: {model_path}")
     videoqa_model, videoqa_processor = load_func(
         model_path=model_path,
         n_local=args.n_local,
-        topk=args.retrieve_size,
+        topk=retrieval_topk,
         chunk_size=args.retrieve_chunk_size,
     )
 
@@ -223,9 +427,16 @@ def work(QA_CLASS):
         qa_processor=videoqa_processor,
         retrieve_size=args.retrieve_size,
         chunk_size=args.retrieve_chunk_size,
+        layer_retrieve_sizes=args.layer_retrieve_sizes,
+        dynamic_retrieve_alpha=args.dynamic_retrieve_alpha,
+        dynamic_retrieve_min_size=(dynamic_retrieve_policy or {}).get('min_topk'),
+        dynamic_retrieve_max_size=(dynamic_retrieve_policy or {}).get('max_topk'),
+        dynamic_retrieve_normalize=args.dynamic_retrieve_normalize,
+        dynamic_retrieve_alphas=dynamic_retrieve_alphas,
         num_chunks=args.num_chunks,
         chunk_idx=args.chunk_idx,
         save_dir=args.save_dir,
+        save_retrieval_logits=args.save_retrieval_logits,
     )
 
     retrieve_analyzer.analyze(debug=args.debug)

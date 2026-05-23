@@ -204,8 +204,8 @@ class ContextManager:
         self.max_cached_block = max_cached_block
         self.exc_block_size = exc_block_size
         assert exc_block_size <= n_local # no global token in input
-        self.topk = topk
         self.chunk_size = chunk_size
+        self._configure_retrieval_policy(topk)
         self.Attn, _ = get_multi_stage_dot_production_attention(fattn)
         self.fattn = fattn
         self.initialized = False
@@ -217,6 +217,67 @@ class ContextManager:
             GLOBAL_STREAM = torch.cuda.Stream()
 
         self.reset_retrieval()
+
+    def _configure_retrieval_policy(self, topk):
+        self.retrieve_policy_config = topk
+        self.retrieve_policy = 'fixed'
+        self.dynamic_alpha = None
+        self.dynamic_normalize = None
+        self.dynamic_min_topk = None
+        self.dynamic_max_topk = None
+
+        if isinstance(topk, dict) and topk.get('policy') in {'mass_threshold', 'cumulative_mass'}:
+            self.retrieve_policy = str(topk.get('policy'))
+            max_topk = topk.get('max_topk', topk.get('max_rs', topk.get('max_retrieve_size', topk.get('topk'))))
+            if max_topk is None:
+                raise ValueError('dynamic retrieval policy requires max_topk/max_rs/max_retrieve_size.')
+            min_topk = topk.get('min_topk', topk.get('min_rs', topk.get('min_retrieve_size', self.chunk_size)))
+            alpha = topk.get('alpha', topk.get('threshold'))
+            if alpha is None:
+                raise ValueError('dynamic retrieval policy requires alpha/threshold.')
+
+            min_topk = int(min_topk)
+            max_topk = int(max_topk)
+            alpha = float(alpha)
+            if min_topk <= 0 or max_topk <= 0:
+                raise ValueError(f'dynamic retrieve sizes must be positive, got min={min_topk}, max={max_topk}.')
+            if min_topk > max_topk:
+                raise ValueError(f'dynamic min_topk={min_topk} must be <= max_topk={max_topk}.')
+            if not (0.0 < alpha <= 1.0):
+                raise ValueError(f'dynamic alpha must be in (0, 1], got {alpha}.')
+            if min_topk % self.chunk_size != 0 or max_topk % self.chunk_size != 0:
+                raise ValueError(
+                    f'dynamic min/max retrieve sizes must be divisible by chunk_size={self.chunk_size}, '
+                    f'got min={min_topk}, max={max_topk}.'
+                )
+
+            self.topk = max_topk
+            self.dynamic_min_topk = min_topk
+            self.dynamic_max_topk = max_topk
+            self.dynamic_alpha = alpha
+            self.dynamic_normalize = str(topk.get('normalize', 'zscore_softmax')).lower()
+        else:
+            self.topk = int(topk)
+            if self.topk <= 0:
+                raise ValueError(f'topk must be positive, got {self.topk}.')
+            self.dynamic_min_topk = self.topk
+            self.dynamic_max_topk = self.topk
+
+        if self.topk % self.chunk_size != 0:
+            raise ValueError(f'topk={self.topk} must be divisible by chunk_size={self.chunk_size}.')
+
+    def _is_dynamic_retrieval(self):
+        return self.retrieve_policy in {'mass_threshold', 'cumulative_mass'}
+
+    def set_dynamic_retrieval_alpha(self, alpha):
+        if not self._is_dynamic_retrieval():
+            raise ValueError('Cannot set dynamic alpha on a fixed retrieval ContextManager.')
+        alpha = float(alpha)
+        if not (0.0 < alpha <= 1.0):
+            raise ValueError(f'dynamic alpha must be in (0, 1], got {alpha}.')
+        self.dynamic_alpha = alpha
+        if isinstance(self.retrieve_policy_config, dict):
+            self.retrieve_policy_config['alpha'] = alpha
 
     def _remove_lru_blocks(self, u, num_remove: Optional[int] = None, ignore_blocks = None):
         if num_remove is None:
@@ -332,6 +393,8 @@ class ContextManager:
     def reset_retrieval(self):
         self.similarity = None
         self.retrieved_block_indices = None
+        self.last_selected_topk = None
+        self.last_selected_mass = None
         self.to_retrieve = False
 
     def set_retrieved_block_indices(self, retrieved_block_indices):
@@ -417,8 +480,94 @@ class ContextManager:
         assert global_h_k.size(-2) <= self.n_init + self.n_local
         return global_h_k, global_h_v 
 
+    def _build_chunked_logits(self, logits):
+        remainder_size = logits.shape[1] % self.chunk_size
+        main_logits = logits[:, :logits.shape[1] - remainder_size]
+        chunked_logits = main_logits.reshape(self.num_units, -1, self.chunk_size).mean(dim=-1)
+        if remainder_size > 0:
+            remainder_logits = logits[:, -remainder_size:].mean(dim=-1, keepdim=True)
+            chunked_logits = torch.cat([chunked_logits, remainder_logits], dim=1)
+        return chunked_logits
+
+    def _normalize_retrieval_logits(self, logits):
+        scores = logits.float()
+        if self.dynamic_normalize in {'zscore_softmax', 'zscore'}:
+            mean = scores.mean(dim=1, keepdim=True)
+            std = scores.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-6)
+            return torch.softmax((scores - mean) / std, dim=1)
+        if self.dynamic_normalize == 'softmax':
+            return torch.softmax(scores, dim=1)
+        if self.dynamic_normalize in {'minmax_l1', 'minmax'}:
+            min_score = scores.min(dim=1, keepdim=True).values
+            max_score = scores.max(dim=1, keepdim=True).values
+            norm = (scores - min_score) / (max_score - min_score).clamp_min(1e-6)
+            denom = norm.sum(dim=1, keepdim=True).clamp_min(1e-6)
+            return norm / denom
+        if self.dynamic_normalize in {'relu_l1', 'positive_l1'}:
+            norm = torch.relu(scores)
+            denom = norm.sum(dim=1, keepdim=True).clamp_min(1e-6)
+            return norm / denom
+        raise ValueError(f'Unknown dynamic retrieval normalization: {self.dynamic_normalize}')
+
+    def _expand_chunk_indices(self, chunk_indices, block_count):
+        ret = []
+        offsets = torch.arange(self.chunk_size, device=self.global_buffer.device)
+        for u in range(self.num_units):
+            unit_indices = chunk_indices[u]
+            if not isinstance(unit_indices, torch.Tensor):
+                unit_indices = torch.as_tensor(unit_indices, device=offsets.device)
+            unit_indices = unit_indices.to(device=offsets.device, dtype=torch.long)
+            block_indices = unit_indices[:, None] * self.chunk_size + offsets[None, :]
+            block_indices = block_indices.reshape(-1)
+            block_indices = block_indices[block_indices < block_count]
+            ret.append(block_indices.cpu().tolist())
+        return ret
+
+    def _select_dynamic_block_indices(self, chunked_logits, block_count):
+        probs = self._normalize_retrieval_logits(chunked_logits)
+        sorted_probs, sorted_indices = torch.sort(probs, dim=1, descending=True)
+        cumulative = sorted_probs.cumsum(dim=1)
+        reached = cumulative >= self.dynamic_alpha
+        fallback = torch.full(
+            (self.num_units,), sorted_probs.size(1), dtype=torch.long, device=sorted_probs.device
+        )
+        first_reached = reached.to(torch.long).argmax(dim=1) + 1
+        counts = torch.where(reached.any(dim=1), first_reached, fallback)
+
+        min_units = min(max(1, self.dynamic_min_topk // self.chunk_size), sorted_probs.size(1))
+        max_units = min(max(min_units, self.dynamic_max_topk // self.chunk_size), sorted_probs.size(1))
+        counts = counts.clamp(min=min_units, max=max_units)
+
+        selected_chunks = []
+        selected_mass = []
+        for u in range(self.num_units):
+            count = int(counts[u].item())
+            chosen_by_score = sorted_indices[u, :count]
+            selected_chunks.append(torch.sort(chosen_by_score).values)
+            selected_mass.append(float(probs[u, chosen_by_score].sum().item()))
+
+        ret = self._expand_chunk_indices(selected_chunks, block_count)
+        self.last_selected_topk = [len(row) for row in ret]
+        self.last_selected_mass = selected_mass
+        return ret
+
+    def _select_fixed_block_indices(self, chunked_logits, block_count):
+        top_units = min(self.topk // self.chunk_size, chunked_logits.shape[1])
+        ret = chunked_logits.topk(top_units, dim=1).indices
+        ret = ret.sort(dim=1)[0]
+        ret = self._expand_chunk_indices(ret, block_count)
+        self.last_selected_topk = [len(row) for row in ret]
+        self.last_selected_mass = None
+        return ret
+
+    def _select_block_indices_from_logits(self, logits):
+        chunked_logits = self._build_chunked_logits(logits)
+        if self._is_dynamic_retrieval():
+            return self._select_dynamic_block_indices(chunked_logits, logits.shape[1])
+        return self._select_fixed_block_indices(chunked_logits, logits.shape[1])
+
     # Get the indices of the top-k vectors in self.block_k[u] that have the highest similarity with global_h_q[u].
-    # ret: batch_size x topk
+    # ret: batch_size x dynamic_topk or batch_size x topk
     def _calc_block_topk(
         self, global_h_q
     ):
@@ -435,35 +584,29 @@ class ContextManager:
 
                 assert global_k.size(-2) % self.block_size == 0, f'{global_k.shape}'
                 block_num = global_k.size(-2) // self.block_size  # number of frames in local window
-                if block_num <= self.topk:
+                if (not self._is_dynamic_retrieval() and block_num <= self.topk) or block_num <= self.dynamic_min_topk:
                     ret = [list(range(block_num)) for _ in range(self.num_units)]
+                    self.last_selected_topk = [len(row) for row in ret]
+                    self.last_selected_mass = None
                 else:
                     global_k = global_k.transpose(1, 2)  # (batch_size, length - n_init, num_heads, dim_head)
                     global_k = global_k.reshape(self.num_units, block_num, self.block_size, self.unit_size * self.dim_head)  # (batch_size, block_num, block_size, dim)
                     global_k = global_k.mean(dim=-2, keepdim=False)  # (batch_size, block_num, dim)
                     logits = torch.matmul(global_k, global_h_q[:, :, None]).squeeze(dim=-1)  # (batch_size, block_num)
             else:  # The local window is already filled, but the number of input frames is less than 'topk'.
-                ret = [list(range(len(self.global_blocks[0]))) for _ in range(self.num_units)]
+                block_num = len(self.global_blocks[0])
+                if (not self._is_dynamic_retrieval() and block_num <= self.topk) or block_num <= self.dynamic_min_topk:
+                    ret = [list(range(block_num)) for _ in range(self.num_units)]
+                    self.last_selected_topk = [len(row) for row in ret]
+                    self.last_selected_mass = None
+                else:
+                    logits = torch.stack([self.block_k[u].get_cosine_similarity(global_h_q[u]) for u in range(self.num_units)])  # (batch_size, block_num)
         else:
             logits = torch.stack([self.block_k[u].get_cosine_similarity(global_h_q[u]) for u in range(self.num_units)])  # (batch_size, block_num)
 
         if logits is not None:
             self.similarity = logits
-            assert self.topk % self.chunk_size == 0
-            remainder_size = logits.shape[1] % self.chunk_size
-            chunked_logits = logits[:, :logits.shape[1]-remainder_size].reshape(self.num_units, -1, self.chunk_size).mean(dim=-1)  # (batch_size, block_num // chunk_size)
-            if remainder_size > 0:
-                remainder_logits = logits[:, -remainder_size:].mean(dim=-1, keepdim=True)  # (batch_size, 1)
-                chunked_logits = torch.cat([chunked_logits, remainder_logits], dim=1)
-            ret = chunked_logits.topk(self.topk//self.chunk_size, dim=1).indices
-            ret = ret.sort(dim=1)[0][:, :, None]  # (batch_size, topk//chunk_size, 1)
-            ret = ret * self.chunk_size + torch.arange(self.chunk_size, device=ret.device)[None, None, :]  # (batch_size, topk//chunk_size, chunk_size)
-            ret = ret.reshape(self.num_units, -1)  # (batch_size, topk)
-            ret = ret.cpu().tolist()
-
-            # NOTE: The last chunk might cause an index overflow
-            for u in range(self.num_units):
-                ret[u] = list(filter(lambda idx: idx < logits.shape[1], ret[u]))
+            ret = self._select_block_indices_from_logits(logits)
 
         return ret
 

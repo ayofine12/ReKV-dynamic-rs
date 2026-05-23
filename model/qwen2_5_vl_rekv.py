@@ -1,0 +1,382 @@
+import math
+
+import torch
+import torch.nn.functional as F
+from logzero import logger
+from transformers import AutoProcessor
+
+try:
+    from transformers import Qwen2_5_VLForConditionalGeneration
+except ImportError:  # transformers<4.49 does not expose Qwen2.5-VL.
+    Qwen2_5_VLForConditionalGeneration = None
+
+from model.abstract_rekv import Abstract_ReKV
+from model.patch import patch_hf
+
+
+def is_retrieval_policy(topk):
+    return isinstance(topk, dict) and topk.get('policy') in {'mass_threshold', 'cumulative_mass'}
+
+
+def max_topk_value(topk):
+    if is_retrieval_policy(topk):
+        max_topk = topk.get('max_topk', topk.get('max_rs', topk.get('max_retrieve_size', topk.get('topk'))))
+        if max_topk is None:
+            raise ValueError('dynamic retrieval policy requires max_topk/max_rs/max_retrieve_size.')
+        return int(max_topk)
+    if isinstance(topk, dict):
+        values = [value for value in topk.values() if value is not None]
+        return max(max_topk_value(value) for value in values)
+    if isinstance(topk, (list, tuple)):
+        return max(max_topk_value(value) for value in topk)
+    return int(topk)
+
+
+def get_qwen_vl_processor(processor):
+    vision_processor = getattr(processor, "video_processor", None)
+    if vision_processor is None:
+        vision_processor = getattr(processor, "image_processor", None)
+    if vision_processor is None:
+        raise AttributeError("Qwen VL processor has neither video_processor nor image_processor.")
+    return vision_processor
+
+
+if Qwen2_5_VLForConditionalGeneration is not None:
+
+
+    class Qwen2_5_VL_ReKV(Qwen2_5_VLForConditionalGeneration, Abstract_ReKV):
+        def __init__(self, config, processor=None, n_frame_tokens=None, init_prompt_ids=None, n_local=None, topk=None, chunk_size=1):
+            Qwen2_5_VLForConditionalGeneration.__init__(self, config)
+            if processor is not None:
+                Abstract_ReKV.__init__(self, processor, n_frame_tokens, init_prompt_ids, n_local, topk, chunk_size)
+
+        def get_prompt(self, query, mc=False):
+            prompt = f"{query}<|im_end|>\n<|im_start|>assistant\n"
+            if mc:
+                prompt += "Best option: ("
+            return prompt
+
+        def _square_resize_video_chunk(self, video_chunk):
+            frame_size = int(getattr(self, "frame_size", 0) or 0)
+            if frame_size <= 0:
+                return video_chunk
+
+            is_tensor = isinstance(video_chunk, torch.Tensor)
+            video = video_chunk if is_tensor else torch.as_tensor(video_chunk)
+            if video.ndim != 4 or video.shape[-1] != 3:
+                raise ValueError(f"Expected video chunk shape (T, H, W, 3), got {tuple(video.shape)}")
+
+            height, width = int(video.shape[1]), int(video.shape[2])
+            if height == frame_size and width == frame_size:
+                return video_chunk
+
+            orig_dtype = video.dtype
+            video_float = video.permute(0, 3, 1, 2).float()
+            scale = min(frame_size / height, frame_size / width)
+            resized_h = max(1, int(round(height * scale)))
+            resized_w = max(1, int(round(width * scale)))
+            resized = F.interpolate(
+                video_float,
+                size=(resized_h, resized_w),
+                mode="bilinear",
+                align_corners=False,
+            )
+
+            canvas = resized.new_zeros((resized.shape[0], resized.shape[1], frame_size, frame_size))
+            top = (frame_size - resized_h) // 2
+            left = (frame_size - resized_w) // 2
+            canvas[:, :, top:top + resized_h, left:left + resized_w] = resized
+
+            if orig_dtype == torch.uint8:
+                canvas = canvas.round().clamp(0, 255).to(torch.uint8)
+            else:
+                canvas = canvas.to(orig_dtype)
+            return canvas.permute(0, 2, 3, 1).cpu()
+
+        def _prepare_video_inputs(self, video_chunk):
+            video_chunk = self._square_resize_video_chunk(video_chunk)
+            video_inputs = self.processor(
+                text=["<|vision_start|><|video_pad|><|vision_end|>"],
+                videos=[video_chunk],
+                padding=True,
+                return_tensors="pt",
+            )
+            pixel_values_videos = video_inputs["pixel_values_videos"].to(self.device, self.dtype)
+            video_grid_thw = video_inputs["video_grid_thw"].to(self.device)
+            return pixel_values_videos, video_grid_thw
+
+        def _get_video_features(self, pixel_values_videos, video_grid_thw):
+            if hasattr(self, "get_video_features"):
+                video_features = self.get_video_features(
+                    pixel_values_videos=pixel_values_videos,
+                    video_grid_thw=video_grid_thw,
+                )
+                video_features = getattr(video_features, "pooler_output", video_features)
+                if isinstance(video_features, (list, tuple)):
+                    video_features = torch.cat(video_features, dim=0)
+            else:
+                video_features = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
+            video_features = video_features.unsqueeze(0)
+            return video_features
+
+        def _encode_video_chunk(self, video_chunk):
+            pixel_values_videos, video_grid_thw = self._prepare_video_inputs(video_chunk)
+            video_features = self._get_video_features(pixel_values_videos, video_grid_thw)
+            spatial_tokens = int(
+                video_grid_thw[0, 1].item()
+                * video_grid_thw[0, 2].item()
+                // (get_qwen_vl_processor(self.processor).merge_size ** 2)
+            )
+            assert spatial_tokens == self.n_frame_tokens, (
+                f"Expected {self.n_frame_tokens} tokens per temporal video block, got {spatial_tokens}. "
+                f"video_grid_thw={video_grid_thw.tolist()}. "
+                "Frames should be resized to the configured square frame_size before Qwen processing."
+            )
+            assert self.n_local >= video_features.shape[1], f'n_local: {self.n_local}, video_features: {video_features.shape[1]}'
+
+            output = self.language_model(inputs_embeds=video_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True)
+            self.kv_cache = output.past_key_values
+
+        def _prepare_qa_past_key_values(self, question, retrieved_indices=None):
+            device = self.device
+            input_ids = self.processor.tokenizer(question).input_ids
+            input_ids = torch.as_tensor([input_ids], device=device)
+            for layer_kv in self.kv_cache:
+                layer_kv.set_retrieval()
+
+            if retrieved_indices is None:
+                out = self.language_model(input_ids=input_ids, use_cache=True, past_key_values=self.kv_cache)
+                past_key_values = out.past_key_values
+            else:
+                for layer_kv in self.kv_cache:
+                    assert layer_kv.block_size == self.n_frame_tokens, f'block_size: {layer_kv.block_size}, n_frame_tokens: {self.n_frame_tokens}'
+                    layer_kv.set_retrieved_block_indices(retrieved_indices)
+                out = self.language_model(input_ids=input_ids, use_cache=True, past_key_values=self.kv_cache)
+                past_key_values = out.past_key_values
+
+            self.capture_retrieval_logits()
+
+            for layer_kv in self.kv_cache:
+                layer_kv.reset_retrieval()
+
+            return past_key_values
+
+        def _get_choice_token_ids(self, num_choices):
+            if not hasattr(self, "_choice_token_id_cache"):
+                self._choice_token_id_cache = {}
+
+            cache_key = num_choices
+            if cache_key in self._choice_token_id_cache:
+                return self._choice_token_id_cache[cache_key]
+
+            choice_letters = "ABCDEFGH"[:num_choices]
+            token_ids = []
+            for letter in choice_letters:
+                ids = self.processor.tokenizer(letter, add_special_tokens=False).input_ids
+                if len(ids) != 1:
+                    raise ValueError(f"Expected single token for choice letter {letter!r}, got {ids}")
+                token_ids.append(ids[0])
+
+            self._choice_token_id_cache[cache_key] = (choice_letters, token_ids)
+            return self._choice_token_id_cache[cache_key]
+
+        @torch.inference_mode()
+        def question_answering(self, input_text, max_new_tokens=128, retrieved_indices=None):
+            device = self.device
+            stop_token_ids = [self.processor.tokenizer.eos_token_id]
+
+            output_ids = []
+            past_key_values = self._prepare_qa_past_key_values(input_text["question"], retrieved_indices=retrieved_indices)
+
+            for i in range(max_new_tokens):
+                if i == 0:
+                    input_ids = self.processor.tokenizer(input_text["prompt"]).input_ids
+                    input_ids = torch.as_tensor([input_ids], device=device)
+                    inputs_embeds = self.get_input_embeddings()(input_ids)
+                    out = self.language_model(inputs_embeds=inputs_embeds, use_cache=True, past_key_values=past_key_values)
+                    past_key_values = out.past_key_values
+                    logits = self.lm_head(out["last_hidden_state"])
+                else:
+                    out = self.language_model(
+                        input_ids=torch.as_tensor([[token]], device=device),
+                        use_cache=True,
+                        past_key_values=past_key_values,
+                    )
+                    logits = self.lm_head(out["last_hidden_state"])
+                    past_key_values = out.past_key_values
+
+                last_token_logits = logits[0, -1, :]
+                _, indices = torch.topk(last_token_logits, 2)
+                token = int(indices.tolist()[0])
+                output_ids.append(token)
+                if token in stop_token_ids:
+                    break
+
+            output = self.processor.tokenizer.decode(
+                output_ids,
+                skip_special_tokens=True,
+                spaces_between_special_tokens=False,
+                clean_up_tokenization_spaces=True,
+            )
+            return output
+
+        @torch.inference_mode()
+        def multiple_choice_answering(self, input_text, num_choices, retrieved_indices=None, return_scores=False):
+            device = self.device
+            choice_letters, choice_token_ids = self._get_choice_token_ids(num_choices)
+            past_key_values = self._prepare_qa_past_key_values(input_text["question"], retrieved_indices=retrieved_indices)
+
+            input_ids = self.processor.tokenizer(input_text["prompt"]).input_ids
+            input_ids = torch.as_tensor([input_ids], device=device)
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+            out = self.language_model(inputs_embeds=inputs_embeds, use_cache=True, past_key_values=past_key_values)
+            logits = self.lm_head(out["last_hidden_state"])
+            last_token_logits = logits[0, -1, :]
+
+            choice_token_ids_tensor = torch.as_tensor(choice_token_ids, device=device)
+            choice_logits = last_token_logits.index_select(0, choice_token_ids_tensor).float()
+            choice_logprobs = torch.log_softmax(choice_logits, dim=0)
+            choice_probs = choice_logprobs.exp()
+            pred_idx = int(torch.argmax(choice_logits).item())
+            pred_answer = choice_letters[pred_idx]
+
+            if not return_scores:
+                return pred_answer
+
+            sorted_probs, sorted_indices = torch.sort(choice_probs, descending=True)
+            sorted_logits = choice_logits.index_select(0, sorted_indices)
+            top1_prob = float(sorted_probs[0].item())
+            top2_prob = float(sorted_probs[1].item()) if num_choices > 1 else 0.0
+            prob_margin = top1_prob - top2_prob
+            logit_margin = (
+                float((sorted_logits[0] - sorted_logits[1]).item())
+                if num_choices > 1
+                else float('inf')
+            )
+            entropy = float((-(choice_probs * choice_logprobs).sum()).item())
+            normalized_entropy = entropy / math.log(num_choices) if num_choices > 1 else 0.0
+
+            return {
+                'pred_answer': pred_answer,
+                'pred_choice': pred_answer,
+                'choice_logits': {
+                    letter: float(score.item())
+                    for letter, score in zip(choice_letters, choice_logits)
+                },
+                'choice_logprobs': {
+                    letter: float(score.item())
+                    for letter, score in zip(choice_letters, choice_logprobs)
+                },
+                'choice_probs': {
+                    letter: float(score.item())
+                    for letter, score in zip(choice_letters, choice_probs)
+                },
+                'top1_prob': top1_prob,
+                'top2_prob': top2_prob,
+                'prob_margin': prob_margin,
+                'logit_margin': logit_margin,
+                'choice_entropy': entropy,
+                'normalized_choice_entropy': normalized_entropy,
+            }
+
+def load_model(model_path='/mnt/models/qwen/Qwen2.5-VL-7B-Instruct',
+               n_init=None, n_local=None, local_block_count=None, topk=64, chunk_size=1,
+               frame_size=224, internal_block_size=None):
+    if Qwen2_5_VLForConditionalGeneration is None:
+        raise ImportError(
+            "Qwen2.5-VL requires a transformers version that exposes "
+            "Qwen2_5_VLForConditionalGeneration. Update the rekv env, e.g. "
+            "`/root/mwnoh/anaconda3/envs/rekv/bin/python -m pip install -U 'transformers>=4.49.0'`."
+        )
+
+    device = 'cuda'
+    processor = AutoProcessor.from_pretrained(
+        model_path,
+        min_pixels=frame_size * frame_size,
+        max_pixels=frame_size * frame_size,
+    )
+    vision_processor = get_qwen_vl_processor(processor)
+    spatial_unit = vision_processor.patch_size * vision_processor.merge_size
+    assert frame_size % spatial_unit == 0, (
+        f"frame_size must be divisible by patch_size * merge_size ({spatial_unit}), got {frame_size}"
+    )
+    n_frame_tokens = (frame_size // spatial_unit) ** 2
+    if local_block_count is not None:
+        if local_block_count < 1:
+            raise ValueError(f"local_block_count must be positive, got {local_block_count}.")
+        resolved_n_local = local_block_count * n_frame_tokens
+    else:
+        resolved_n_local = n_local
+    if resolved_n_local is None:
+        raise ValueError("Either n_local or local_block_count must be provided.")
+
+    max_retrieval_topk = max_topk_value(topk)
+    min_retrieval_n_local = max_retrieval_topk * n_frame_tokens
+    if resolved_n_local < min_retrieval_n_local:
+        raise ValueError(
+            f"n_local={resolved_n_local} is too small for max retrieve_size/topk={max_retrieval_topk} "
+            f"with n_frame_tokens={n_frame_tokens}. Current ReKV attention requires "
+            f"n_local >= max_topk * n_frame_tokens = {min_retrieval_n_local}."
+        )
+
+    if internal_block_size is None or internal_block_size <= 0:
+        resolved_internal_block_size = n_frame_tokens
+    else:
+        if internal_block_size < n_frame_tokens:
+            raise ValueError(
+                f"internal_block_size={internal_block_size} must be >= n_frame_tokens={n_frame_tokens}."
+            )
+        if internal_block_size % n_frame_tokens != 0:
+            raise ValueError(
+                f"internal_block_size={internal_block_size} must be a multiple of "
+                f"n_frame_tokens={n_frame_tokens}."
+            )
+        if internal_block_size > resolved_n_local:
+            raise ValueError(
+                f"internal_block_size={internal_block_size} must be <= n_local={resolved_n_local}."
+            )
+        resolved_internal_block_size = internal_block_size
+
+    max_cached_block = max(128, max_retrieval_topk)
+
+    init_prompt = '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n'
+    init_prompt_ids = processor.tokenizer(init_prompt, return_tensors="pt").input_ids.to(device)
+    inf_llm_config = {
+        'n_init': init_prompt_ids.shape[1] if n_init is None else n_init,
+        'n_local': resolved_n_local,
+        'fattn': True,
+        'block_size': n_frame_tokens,
+        'topk': topk,
+        'chunk_size': chunk_size,
+        'max_cached_block': max_cached_block,
+        'exc_block_size': resolved_internal_block_size,
+        'pin_memory': True,
+    }
+    model = Qwen2_5_VL_ReKV.from_pretrained(
+        model_path,
+        device_map="auto",
+        low_cpu_mem_usage=True,
+        torch_dtype=torch.bfloat16,
+    )
+    Abstract_ReKV.__init__(
+        model,
+        processor=processor,
+        n_frame_tokens=n_frame_tokens,
+        init_prompt_ids=init_prompt_ids,
+        n_local=resolved_n_local,
+        topk=topk,
+        chunk_size=chunk_size,
+    )
+    model.frame_size = frame_size
+    language_model = getattr(model.model, "language_model", model.model)
+    model.language_model = patch_hf(language_model, **inf_llm_config)
+
+    for k, v in inf_llm_config.items():
+        logger.info(f'{k}: {v}')
+    logger.info(f'frame_size: {frame_size}')
+    logger.info(f'n_frame_tokens: {n_frame_tokens}')
+    logger.info(f'local_block_count: {local_block_count}')
+    logger.info(f'internal_block_size: {resolved_internal_block_size}')
+
+    model.eval()
+    return model, processor

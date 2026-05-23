@@ -133,22 +133,32 @@ def patch_hf(
 
     forward = huggingface_forward(rekv_attention_forward(**attn_kwargs))
 
-    if isinstance(model, LlamaForCausalLM):
-        Attention = model.model.layers[0].self_attn.__class__
-        Model = model.model.__class__
-    elif isinstance(model, MistralForCausalLM):
-        Attention = model.model.layers[0].self_attn.__class__
-        Model = model.model.__class__
-    elif isinstance(model, Qwen2ForCausalLM) or isinstance(model, Qwen2Model):
-        Attention = model.model.layers[0].self_attn.__class__
-        Model = model.model.__class__
-    elif model.__class__.__name__ == "MiniCPMForCausalLM":
-        Attention = model.model.layers[0].self_attn.__class__
-        Model = model.model.__class__
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        model_root = model.model
+    elif hasattr(model, "layers"):
+        model_root = model
     else:
-        raise ValueError(f"Only supports llama, mistral and qwen2 models, not {model.__class__.__name__}.")
+        model_root = None
 
-    hf_rope = model.model.layers[0].self_attn.rotary_emb 
+    if isinstance(model, LlamaForCausalLM):
+        Attention = model_root.layers[0].self_attn.__class__
+        Model = model_root.__class__
+    elif isinstance(model, MistralForCausalLM):
+        Attention = model_root.layers[0].self_attn.__class__
+        Model = model_root.__class__
+    elif isinstance(model, Qwen2ForCausalLM) or isinstance(model, Qwen2Model):
+        Attention = model_root.layers[0].self_attn.__class__
+        Model = model_root.__class__
+    elif model.__class__.__name__ in {"Qwen2_5_VLModel"}:
+        Attention = model_root.layers[0].self_attn.__class__
+        Model = model_root.__class__
+    elif model.__class__.__name__ == "MiniCPMForCausalLM":
+        Attention = model_root.layers[0].self_attn.__class__
+        Model = model_root.__class__
+    else:
+        raise ValueError(f"Only supports llama, mistral, qwen2 and qwen2.5-vl models, not {model.__class__.__name__}.")
+
+    hf_rope = model_root.layers[0].self_attn.rotary_emb 
     if isinstance(hf_rope, Qwen2RotaryEmbedding):
         base = hf_rope.base
         distance_scale = 1.0
@@ -163,7 +173,11 @@ def patch_hf(
         base,
         distance_scale
     )
-    model.model.position_bias = rope
+    model_root.position_bias = rope
+
+    for layer_idx, layer in enumerate(model_root.layers):
+        if hasattr(layer, 'self_attn'):
+            layer.self_attn._rekv_layer_idx = layer_idx
 
     def set_forward(m):
         if isinstance(m, Attention):
@@ -172,7 +186,7 @@ def patch_hf(
 
     model.apply(set_forward)
 
-    model.model._old_forward = model.model.forward
-    model.model.forward = model_forward.__get__(model.model, Model)
+    model_root._old_forward = model_root.forward
+    model_root.forward = model_forward.__get__(model_root, Model)
 
     return model

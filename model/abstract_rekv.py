@@ -13,11 +13,71 @@ class Abstract_ReKV:
         self.n_local = n_local
         self.topk = topk
         self.chunk_size = chunk_size
+        self.last_retrieval_logits = None
 
     def clear_cache(self):
         self.kv_cache = None
+        self.last_retrieval_logits = None
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+
+    def capture_retrieval_logits(self):
+        layers = []
+        if self.kv_cache is None:
+            self.last_retrieval_logits = {"retrieval_available": False, "layers": []}
+            return self.last_retrieval_logits
+
+        for layer_idx, layer_kv in enumerate(self.kv_cache):
+            similarity = getattr(layer_kv, "similarity", None)
+            if similarity is None:
+                logits = None
+            else:
+                logits = similarity.detach().float().cpu()
+
+            retrieved_block_indices = getattr(layer_kv, "retrieved_block_indices", None)
+            actual_topk = None
+            if retrieved_block_indices:
+                actual_topk = len(retrieved_block_indices[0])
+
+            layers.append({
+                "layer_idx": layer_idx,
+                "topk": int(getattr(layer_kv, "topk", self.topk)),
+                "actual_topk": actual_topk,
+                "chunk_size": int(getattr(layer_kv, "chunk_size", self.chunk_size)),
+                "block_size": int(getattr(layer_kv, "block_size", self.n_frame_tokens)),
+                "num_global_block": int(getattr(layer_kv, "num_global_block", 0)),
+                "retrieved_block_indices": retrieved_block_indices,
+                "score_logits": logits,
+                "retrieval_policy": getattr(layer_kv, "retrieve_policy", "fixed"),
+                "dynamic_alpha": getattr(layer_kv, "dynamic_alpha", None),
+                "dynamic_normalize": getattr(layer_kv, "dynamic_normalize", None),
+                "dynamic_min_topk": getattr(layer_kv, "dynamic_min_topk", None),
+                "dynamic_max_topk": getattr(layer_kv, "dynamic_max_topk", None),
+                "selected_topk_per_unit": getattr(layer_kv, "last_selected_topk", None),
+                "selected_mass_per_unit": getattr(layer_kv, "last_selected_mass", None),
+            })
+
+        self.last_retrieval_logits = {
+            "retrieval_available": any(layer["score_logits"] is not None for layer in layers),
+            "layers": layers,
+        }
+        return self.last_retrieval_logits
+
+    def get_last_retrieval_logits(self):
+        return self.last_retrieval_logits
+
+    def set_dynamic_retrieval_alpha(self, alpha):
+        alpha = float(alpha)
+        if not (0.0 < alpha <= 1.0):
+            raise ValueError(f'dynamic alpha must be in (0, 1], got {alpha}.')
+        if isinstance(self.topk, dict):
+            self.topk['alpha'] = alpha
+        if self.kv_cache is None:
+            return
+        for layer_kv in self.kv_cache:
+            if not hasattr(layer_kv, 'set_dynamic_retrieval_alpha'):
+                raise AttributeError('KV cache layer does not support dynamic alpha updates.')
+            layer_kv.set_dynamic_retrieval_alpha(alpha)
 
     @torch.inference_mode()
     def encode_init_prompt(self):

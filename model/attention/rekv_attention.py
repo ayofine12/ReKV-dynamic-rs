@@ -6,6 +6,28 @@ from .kv_cache_manager import ContextManager
 from .dot_production_attention import get_multi_stage_dot_production_attention
 
 
+def is_retrieval_policy(value):
+    return isinstance(value, dict) and value.get('policy') in {'mass_threshold', 'cumulative_mass'}
+
+
+def resolve_layer_value(value, layer_idx):
+    if is_retrieval_policy(value):
+        return value
+    if isinstance(value, dict):
+        if layer_idx in value:
+            return value[layer_idx]
+        if str(layer_idx) in value:
+            return value[str(layer_idx)]
+        return value.get('default')
+    if isinstance(value, (list, tuple)):
+        if layer_idx is None:
+            return value[0]
+        if layer_idx < len(value):
+            return value[layer_idx]
+        return value[-1]
+    return value
+
+
 def rekv_attention_forward(
     n_local, n_init, topk, chunk_size,
     block_size, max_cached_block,
@@ -49,10 +71,12 @@ def rekv_attention_forward(
                 position_bias._sin_cached = position_bias._sin_cached.to(h_q.device)
 
         if past_key_value is None:
+            layer_idx = getattr(self, '_rekv_layer_idx', None)
+            layer_topk = resolve_layer_value(topk, layer_idx)
             past_key_value = ContextManager(
                 position_bias,
-                n_init, n_local, 
-                block_size, max_cached_block, topk, chunk_size, exc_block_size,
+                n_init, n_local,
+                block_size, max_cached_block, layer_topk, chunk_size, exc_block_size,
                 fattn,
                 async_global_stream,
                 pin_memory,
