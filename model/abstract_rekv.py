@@ -79,6 +79,22 @@ class Abstract_ReKV:
                 raise AttributeError('KV cache layer does not support dynamic alpha updates.')
             layer_kv.set_dynamic_retrieval_alpha(alpha)
 
+    def set_fixed_retrieve_size(self, retrieve_size):
+        retrieve_size = int(retrieve_size)
+        if retrieve_size <= 0:
+            raise ValueError(f'retrieve_size must be positive, got {retrieve_size}.')
+        if retrieve_size % self.chunk_size != 0:
+            raise ValueError(
+                f'retrieve_size={retrieve_size} must be divisible by chunk_size={self.chunk_size}.'
+            )
+        self.topk = retrieve_size
+        if self.kv_cache is None:
+            return
+        for layer_kv in self.kv_cache:
+            if not hasattr(layer_kv, 'set_fixed_retrieve_size'):
+                raise AttributeError('KV cache layer does not support fixed retrieve-size updates.')
+            layer_kv.set_fixed_retrieve_size(retrieve_size)
+
     @torch.inference_mode()
     def encode_init_prompt(self):
         if not isinstance(self.init_prompt_ids, torch.Tensor):

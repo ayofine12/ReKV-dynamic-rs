@@ -279,6 +279,22 @@ class ContextManager:
         if isinstance(self.retrieve_policy_config, dict):
             self.retrieve_policy_config['alpha'] = alpha
 
+    def set_fixed_retrieve_size(self, retrieve_size):
+        retrieve_size = int(retrieve_size)
+        if retrieve_size <= 0:
+            raise ValueError(f'retrieve_size must be positive, got {retrieve_size}.')
+        if retrieve_size % self.chunk_size != 0:
+            raise ValueError(
+                f'retrieve_size={retrieve_size} must be divisible by chunk_size={self.chunk_size}.'
+            )
+        self.retrieve_policy_config = retrieve_size
+        self.retrieve_policy = 'fixed'
+        self.dynamic_alpha = None
+        self.dynamic_normalize = None
+        self.dynamic_min_topk = retrieve_size
+        self.dynamic_max_topk = retrieve_size
+        self.topk = retrieve_size
+
     def _remove_lru_blocks(self, u, num_remove: Optional[int] = None, ignore_blocks = None):
         if num_remove is None:
             num_remove = len(self.cached_blocks[u]) - self.max_cached_block

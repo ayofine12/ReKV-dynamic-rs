@@ -132,8 +132,14 @@ class ReKVOfflineVQA(BaseVQA):
         self.qa_model.encode_init_prompt()
         self.qa_model.encode_video(video_tensor)
 
-        alpha_values = self.dynamic_retrieve_alphas or [None]
         for sample in video_sample['conversations']:
+            if self.retrieve_sizes:
+                for retrieve_size in self.retrieve_sizes:
+                    self.set_active_retrieve_size(retrieve_size)
+                    self._answer_sample(video_sample, sample)
+                continue
+
+            alpha_values = self.dynamic_retrieve_alphas or [None]
             for alpha in alpha_values:
                 if alpha is not None:
                     self.set_active_dynamic_alpha(alpha)

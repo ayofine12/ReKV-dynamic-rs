@@ -76,6 +76,7 @@ class BaseVQA:
                  dynamic_retrieve_max_size=None,
                  dynamic_retrieve_normalize='zscore_softmax',
                  dynamic_retrieve_alphas=None,
+                 retrieve_sizes=None,
                  save_retrieval_logits=False) -> None:
         
         self.sample_fps = sample_fps
@@ -93,6 +94,7 @@ class BaseVQA:
         self.dynamic_retrieve_max_size = dynamic_retrieve_max_size
         self.dynamic_retrieve_normalize = dynamic_retrieve_normalize
         self.dynamic_retrieve_alphas = dynamic_retrieve_alphas or []
+        self.retrieve_sizes = retrieve_sizes or []
 
         self.num_chunks = num_chunks
         self.chunk_idx = chunk_idx
@@ -138,6 +140,9 @@ class BaseVQA:
     def get_alpha_save_dir(self, alpha):
         return os.path.join(self.save_dir, f'alpha{self._alpha_label(alpha)}-{self.sample_fps}')
 
+    def get_retrieve_size_save_dir(self, retrieve_size):
+        return os.path.join(self.save_dir, f'rs{int(retrieve_size)}-{self.sample_fps}')
+
     def set_active_dynamic_alpha(self, alpha):
         alpha = float(alpha)
         self.dynamic_retrieve_alpha = alpha
@@ -148,7 +153,25 @@ class BaseVQA:
             os.makedirs(self._active_save_dir, exist_ok=True)
             self.output_csv_path = os.path.join(self._active_save_dir, f'{self.num_chunks}_{self.chunk_idx}.csv')
 
+    def set_active_retrieve_size(self, retrieve_size):
+        retrieve_size = int(retrieve_size)
+        self.retrieve_size = retrieve_size
+        if hasattr(self.qa_model, 'set_fixed_retrieve_size'):
+            self.qa_model.set_fixed_retrieve_size(retrieve_size)
+        if self.retrieve_sizes:
+            self._active_save_dir = self.get_retrieve_size_save_dir(retrieve_size)
+            os.makedirs(self._active_save_dir, exist_ok=True)
+            self.output_csv_path = os.path.join(self._active_save_dir, f'{self.num_chunks}_{self.chunk_idx}.csv')
+
     def prepare_output_files(self):
+        if self.retrieve_sizes:
+            for retrieve_size in self.retrieve_sizes:
+                run_dir = self.get_retrieve_size_save_dir(retrieve_size)
+                os.makedirs(run_dir, exist_ok=True)
+                csv_path = os.path.join(run_dir, f'{self.num_chunks}_{self.chunk_idx}.csv')
+                if os.path.exists(csv_path):
+                    os.remove(csv_path)
+            return
         if self.dynamic_retrieve_alphas:
             for alpha in self.dynamic_retrieve_alphas:
                 run_dir = self.get_alpha_save_dir(alpha)
@@ -210,7 +233,7 @@ class BaseVQA:
         row['dynamic_retrieve_min_size'] = self.dynamic_retrieve_min_size
         row['dynamic_retrieve_max_size'] = self.dynamic_retrieve_max_size
         row['dynamic_retrieve_normalize'] = self.dynamic_retrieve_normalize
-        self.record[(self.retrieve_size, self.chunk_size)].append(row)
+        self.record.setdefault((self.retrieve_size, self.chunk_size), []).append(row)
 
         stream_row = {col: row.get(col, '') for col in self.stream_result_columns}
         stream_row['retrieve_size'] = self.retrieve_size
@@ -304,6 +327,17 @@ def parse_dynamic_retrieve_alphas(spec):
     return alphas
 
 
+def parse_retrieve_sizes(spec):
+    if spec is None or str(spec).strip() == '':
+        return []
+    pieces = str(spec).replace(',', ' ').split()
+    values = [int(piece) for piece in pieces]
+    for value in values:
+        if value <= 0:
+            raise argparse.ArgumentTypeError(f"retrieve size must be positive, got {value}.")
+    return values
+
+
 def build_dynamic_retrieve_policy(args):
     if args.dynamic_retrieve_alpha is None:
         return None
@@ -360,6 +394,8 @@ def work(QA_CLASS):
     parser.add_argument("--model", type=str, default="llava_ov_7b")
     parser.add_argument("--n_local", type=int, default=15000)
     parser.add_argument("--retrieve_size", type=int, default=64)
+    parser.add_argument("--retrieve_sizes", type=str, default=None,
+                        help="Run multiple fixed retrieve sizes in one video-encoding pass, e.g. '16 64'.")
     parser.add_argument("--layer_retrieve_sizes", type=str, default=None,
                         help="Optional comma-separated per-layer overrides, e.g. '5:64' or '4-5:64'.")
     parser.add_argument("--dynamic_retrieve_alpha", type=float, default=None,
@@ -388,6 +424,14 @@ def work(QA_CLASS):
         dynamic_retrieve_alphas = parse_dynamic_retrieve_alphas(args.dynamic_retrieve_alphas)
     except argparse.ArgumentTypeError as exc:
         parser.error(str(exc))
+    try:
+        retrieve_sizes = parse_retrieve_sizes(args.retrieve_sizes)
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
+    if retrieve_sizes and dynamic_retrieve_alphas:
+        parser.error("Use either --retrieve_sizes or --dynamic_retrieve_alphas, not both.")
+    if retrieve_sizes and args.dynamic_retrieve_alpha is not None:
+        parser.error("Use either --retrieve_sizes or --dynamic_retrieve_alpha, not both.")
     if dynamic_retrieve_alphas:
         if args.dynamic_retrieve_alpha is not None:
             parser.error("Use either --dynamic_retrieve_alpha or --dynamic_retrieve_alphas, not both.")
@@ -398,7 +442,7 @@ def work(QA_CLASS):
         parser.error(str(exc))
     if dynamic_retrieve_policy is not None and layer_retrieve_sizes is not None:
         parser.error("--dynamic_retrieve_alpha and --layer_retrieve_sizes are currently mutually exclusive.")
-    retrieval_topk = dynamic_retrieve_policy or layer_retrieve_sizes or args.retrieve_size
+    retrieval_topk = dynamic_retrieve_policy or layer_retrieve_sizes or (max(retrieve_sizes) if retrieve_sizes else args.retrieve_size)
 
     # fix random seed
     random.seed(2024)
@@ -433,6 +477,7 @@ def work(QA_CLASS):
         dynamic_retrieve_max_size=(dynamic_retrieve_policy or {}).get('max_topk'),
         dynamic_retrieve_normalize=args.dynamic_retrieve_normalize,
         dynamic_retrieve_alphas=dynamic_retrieve_alphas,
+        retrieve_sizes=retrieve_sizes,
         num_chunks=args.num_chunks,
         chunk_idx=args.chunk_idx,
         save_dir=args.save_dir,
