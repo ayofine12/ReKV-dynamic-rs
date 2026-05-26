@@ -82,6 +82,10 @@ class BaseVQA:
                  relative_retrieve_normalize='zscore_softmax',
                  relative_retrieve_betas=None,
                  retrieve_sizes=None,
+                 mc_answer_mode='generate',
+                 confidence_fallback_retrieve_size=None,
+                 confidence_fallback_threshold=None,
+                 confidence_fallback_metric='prob_margin',
                  save_retrieval_logits=False) -> None:
         
         self.sample_fps = sample_fps
@@ -105,6 +109,12 @@ class BaseVQA:
         self.relative_retrieve_normalize = relative_retrieve_normalize
         self.relative_retrieve_betas = relative_retrieve_betas or []
         self.retrieve_sizes = retrieve_sizes or []
+        self.mc_answer_mode = mc_answer_mode
+        self.confidence_fallback_retrieve_size = confidence_fallback_retrieve_size
+        self.confidence_fallback_threshold = confidence_fallback_threshold
+        self.confidence_fallback_metric = confidence_fallback_metric
+        self.confidence_fallback_enabled = confidence_fallback_retrieve_size is not None
+        self.confidence_base_retrieve_size = retrieve_size
 
         self.num_chunks = num_chunks
         self.chunk_idx = chunk_idx
@@ -127,6 +137,17 @@ class BaseVQA:
             'dynamic_retrieve_max_size', 'dynamic_retrieve_normalize',
             'relative_retrieve_beta', 'relative_retrieve_min_size',
             'relative_retrieve_max_size', 'relative_retrieve_normalize',
+            'mc_answer_mode', 'choice_top1_prob', 'choice_top2_prob',
+            'choice_prob_margin', 'choice_logit_margin', 'choice_entropy',
+            'choice_normalized_entropy', 'choice_logits_json',
+            'choice_logprobs_json', 'choice_probs_json',
+            'confidence_fallback_triggered', 'confidence_fallback_metric',
+            'confidence_fallback_threshold', 'confidence_fallback_value',
+            'confidence_fallback_retrieve_size', 'confidence_initial_retrieve_size',
+            'confidence_final_retrieve_size', 'confidence_effective_retrieve_size',
+            'initial_pred_choice', 'initial_top1_prob', 'initial_top2_prob',
+            'initial_prob_margin', 'initial_logit_margin', 'initial_choice_entropy',
+            'initial_normalized_choice_entropy', 'initial_retrieval_logits_path',
         ]
 
     def split_list(self, lst, n):
@@ -273,6 +294,10 @@ class BaseVQA:
         row['relative_retrieve_min_size'] = self.relative_retrieve_min_size
         row['relative_retrieve_max_size'] = self.relative_retrieve_max_size
         row['relative_retrieve_normalize'] = self.relative_retrieve_normalize
+        row['mc_answer_mode'] = self.mc_answer_mode
+        row['confidence_fallback_metric'] = self.confidence_fallback_metric
+        row['confidence_fallback_threshold'] = self.confidence_fallback_threshold
+        row['confidence_fallback_retrieve_size'] = self.confidence_fallback_retrieve_size
         self.record.setdefault((self.retrieve_size, self.chunk_size), []).append(row)
 
         stream_row = {col: row.get(col, '') for col in self.stream_result_columns}
@@ -287,6 +312,10 @@ class BaseVQA:
         stream_row['relative_retrieve_min_size'] = self.relative_retrieve_min_size
         stream_row['relative_retrieve_max_size'] = self.relative_retrieve_max_size
         stream_row['relative_retrieve_normalize'] = self.relative_retrieve_normalize
+        stream_row['mc_answer_mode'] = self.mc_answer_mode
+        stream_row['confidence_fallback_metric'] = self.confidence_fallback_metric
+        stream_row['confidence_fallback_threshold'] = self.confidence_fallback_threshold
+        stream_row['confidence_fallback_retrieve_size'] = self.confidence_fallback_retrieve_size
 
         file_exists = os.path.exists(self.output_csv_path)
         with open(self.output_csv_path, 'a', newline='') as f:
@@ -335,6 +364,14 @@ class BaseVQA:
                 df['relative_retrieve_max_size'] = self.relative_retrieve_max_size
             if 'relative_retrieve_normalize' not in df.columns:
                 df['relative_retrieve_normalize'] = self.relative_retrieve_normalize
+            if 'mc_answer_mode' not in df.columns:
+                df['mc_answer_mode'] = self.mc_answer_mode
+            if 'confidence_fallback_metric' not in df.columns:
+                df['confidence_fallback_metric'] = self.confidence_fallback_metric
+            if 'confidence_fallback_threshold' not in df.columns:
+                df['confidence_fallback_threshold'] = self.confidence_fallback_threshold
+            if 'confidence_fallback_retrieve_size' not in df.columns:
+                df['confidence_fallback_retrieve_size'] = self.confidence_fallback_retrieve_size
             dfs.append(df)
         final_df = pd.concat(dfs, ignore_index=True)
         final_df.to_csv(f'{self.save_dir}/{self.num_chunks}_{self.chunk_idx}.csv', index=False)
@@ -518,6 +555,16 @@ def work(QA_CLASS):
                         choices=['zscore_softmax', 'softmax', 'minmax_l1', 'relu_l1'],
                         help="Normalization used before cumulative-mass dynamic retrieval.")
     parser.add_argument("--retrieve_chunk_size", type=int, default=1)
+    parser.add_argument("--mc_answer_mode", type=str, default='generate',
+                        choices=['generate', 'choice_logits'],
+                        help="How to answer multiple-choice questions. choice_logits scores A/B/C/D next-token logits.")
+    parser.add_argument("--confidence_fallback_retrieve_size", type=int, default=None,
+                        help="If set, answer MC questions with --retrieve_size first and rerun with this fixed retrieve size when confidence is low.")
+    parser.add_argument("--confidence_fallback_threshold", type=float, default=None,
+                        help="Threshold for confidence fallback. Lower is less confident except normalized_choice_entropy.")
+    parser.add_argument("--confidence_fallback_metric", type=str, default='prob_margin',
+                        choices=['prob_margin', 'logit_margin', 'top1_prob', 'normalized_choice_entropy'],
+                        help="Choice-logit confidence metric used for fallback.")
     parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=True)
     parser.add_argument("--save_retrieval_logits", type=str2bool, nargs='?', const=True, default=False)
     args = parser.parse_args()
@@ -550,6 +597,23 @@ def work(QA_CLASS):
             "Use only one retrieval mode among --retrieve_sizes, --dynamic_retrieve_alpha(s), "
             "and --relative_retrieve_beta(s)."
         )
+    if args.confidence_fallback_retrieve_size is not None:
+        if args.confidence_fallback_retrieve_size <= 0:
+            parser.error("--confidence_fallback_retrieve_size must be positive.")
+        if args.confidence_fallback_retrieve_size % args.retrieve_chunk_size != 0:
+            parser.error(
+                "--confidence_fallback_retrieve_size must be divisible by --retrieve_chunk_size."
+            )
+        if args.confidence_fallback_threshold is None:
+            parser.error("--confidence_fallback_threshold is required when confidence fallback is enabled.")
+        if active_modes > 0 or layer_retrieve_sizes is not None:
+            parser.error(
+                "Confidence fallback currently supports fixed --retrieve_size only; "
+                "do not combine it with dynamic/relative/retrieve_sizes/layer overrides."
+            )
+        if args.confidence_fallback_retrieve_size < args.retrieve_size:
+            parser.error("--confidence_fallback_retrieve_size should be >= --retrieve_size.")
+        args.mc_answer_mode = 'choice_logits'
     if dynamic_retrieve_alphas:
         if args.dynamic_retrieve_alpha is not None:
             parser.error("Use either --dynamic_retrieve_alpha or --dynamic_retrieve_alphas, not both.")
@@ -566,7 +630,9 @@ def work(QA_CLASS):
         parser.error(str(exc))
     if (dynamic_retrieve_policy is not None or relative_retrieve_policy is not None) and layer_retrieve_sizes is not None:
         parser.error("Dynamic/relative retrieval and --layer_retrieve_sizes are currently mutually exclusive.")
-    retrieval_topk = relative_retrieve_policy or dynamic_retrieve_policy or layer_retrieve_sizes or (max(retrieve_sizes) if retrieve_sizes else args.retrieve_size)
+    fallback_topk = args.confidence_fallback_retrieve_size
+    fixed_topk = max(args.retrieve_size, fallback_topk) if fallback_topk is not None else args.retrieve_size
+    retrieval_topk = relative_retrieve_policy or dynamic_retrieve_policy or layer_retrieve_sizes or (max(retrieve_sizes) if retrieve_sizes else fixed_topk)
 
     # fix random seed
     random.seed(2024)
@@ -607,6 +673,10 @@ def work(QA_CLASS):
         relative_retrieve_normalize=args.relative_retrieve_normalize,
         relative_retrieve_betas=relative_retrieve_betas,
         retrieve_sizes=retrieve_sizes,
+        mc_answer_mode=args.mc_answer_mode,
+        confidence_fallback_retrieve_size=args.confidence_fallback_retrieve_size,
+        confidence_fallback_threshold=args.confidence_fallback_threshold,
+        confidence_fallback_metric=args.confidence_fallback_metric,
         num_chunks=args.num_chunks,
         chunk_idx=args.chunk_idx,
         save_dir=args.save_dir,
