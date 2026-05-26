@@ -50,11 +50,14 @@ class Abstract_ReKV:
                 "score_logits": logits,
                 "retrieval_policy": getattr(layer_kv, "retrieve_policy", "fixed"),
                 "dynamic_alpha": getattr(layer_kv, "dynamic_alpha", None),
+                "relative_beta": getattr(layer_kv, "dynamic_beta", None),
                 "dynamic_normalize": getattr(layer_kv, "dynamic_normalize", None),
                 "dynamic_min_topk": getattr(layer_kv, "dynamic_min_topk", None),
                 "dynamic_max_topk": getattr(layer_kv, "dynamic_max_topk", None),
                 "selected_topk_per_unit": getattr(layer_kv, "last_selected_topk", None),
                 "selected_mass_per_unit": getattr(layer_kv, "last_selected_mass", None),
+                "relative_reference_mass_per_unit": getattr(layer_kv, "last_relative_reference_mass", None),
+                "relative_target_mass_per_unit": getattr(layer_kv, "last_relative_target_mass", None),
             })
 
         self.last_retrieval_logits = {
@@ -78,6 +81,19 @@ class Abstract_ReKV:
             if not hasattr(layer_kv, 'set_dynamic_retrieval_alpha'):
                 raise AttributeError('KV cache layer does not support dynamic alpha updates.')
             layer_kv.set_dynamic_retrieval_alpha(alpha)
+
+    def set_relative_retrieval_beta(self, beta):
+        beta = float(beta)
+        if not (0.0 < beta <= 1.0):
+            raise ValueError(f'relative beta must be in (0, 1], got {beta}.')
+        if isinstance(self.topk, dict):
+            self.topk['beta'] = beta
+        if self.kv_cache is None:
+            return
+        for layer_kv in self.kv_cache:
+            if not hasattr(layer_kv, 'set_relative_retrieval_beta'):
+                raise AttributeError('KV cache layer does not support relative beta updates.')
+            layer_kv.set_relative_retrieval_beta(beta)
 
     def set_fixed_retrieve_size(self, retrieve_size):
         retrieve_size = int(retrieve_size)

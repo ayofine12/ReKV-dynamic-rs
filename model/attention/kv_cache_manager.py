@@ -222,39 +222,50 @@ class ContextManager:
         self.retrieve_policy_config = topk
         self.retrieve_policy = 'fixed'
         self.dynamic_alpha = None
+        self.dynamic_beta = None
         self.dynamic_normalize = None
         self.dynamic_min_topk = None
         self.dynamic_max_topk = None
 
-        if isinstance(topk, dict) and topk.get('policy') in {'mass_threshold', 'cumulative_mass'}:
+        if isinstance(topk, dict) and topk.get('policy') in {'mass_threshold', 'cumulative_mass', 'relative_mass', 'relative_coverage'}:
             self.retrieve_policy = str(topk.get('policy'))
             max_topk = topk.get('max_topk', topk.get('max_rs', topk.get('max_retrieve_size', topk.get('topk'))))
             if max_topk is None:
                 raise ValueError('dynamic retrieval policy requires max_topk/max_rs/max_retrieve_size.')
             min_topk = topk.get('min_topk', topk.get('min_rs', topk.get('min_retrieve_size', self.chunk_size)))
-            alpha = topk.get('alpha', topk.get('threshold'))
-            if alpha is None:
-                raise ValueError('dynamic retrieval policy requires alpha/threshold.')
 
             min_topk = int(min_topk)
             max_topk = int(max_topk)
-            alpha = float(alpha)
             if min_topk <= 0 or max_topk <= 0:
                 raise ValueError(f'dynamic retrieve sizes must be positive, got min={min_topk}, max={max_topk}.')
             if min_topk > max_topk:
                 raise ValueError(f'dynamic min_topk={min_topk} must be <= max_topk={max_topk}.')
-            if not (0.0 < alpha <= 1.0):
-                raise ValueError(f'dynamic alpha must be in (0, 1], got {alpha}.')
             if min_topk % self.chunk_size != 0 or max_topk % self.chunk_size != 0:
                 raise ValueError(
                     f'dynamic min/max retrieve sizes must be divisible by chunk_size={self.chunk_size}, '
                     f'got min={min_topk}, max={max_topk}.'
                 )
 
+            if self.retrieve_policy in {'relative_mass', 'relative_coverage'}:
+                beta = topk.get('beta', topk.get('coverage'))
+                if beta is None:
+                    raise ValueError('relative mass retrieval policy requires beta/coverage.')
+                beta = float(beta)
+                if not (0.0 < beta <= 1.0):
+                    raise ValueError(f'relative beta must be in (0, 1], got {beta}.')
+                self.dynamic_beta = beta
+            else:
+                alpha = topk.get('alpha', topk.get('threshold'))
+                if alpha is None:
+                    raise ValueError('dynamic retrieval policy requires alpha/threshold.')
+                alpha = float(alpha)
+                if not (0.0 < alpha <= 1.0):
+                    raise ValueError(f'dynamic alpha must be in (0, 1], got {alpha}.')
+                self.dynamic_alpha = alpha
+
             self.topk = max_topk
             self.dynamic_min_topk = min_topk
             self.dynamic_max_topk = max_topk
-            self.dynamic_alpha = alpha
             self.dynamic_normalize = str(topk.get('normalize', 'zscore_softmax')).lower()
         else:
             self.topk = int(topk)
@@ -267,17 +278,30 @@ class ContextManager:
             raise ValueError(f'topk={self.topk} must be divisible by chunk_size={self.chunk_size}.')
 
     def _is_dynamic_retrieval(self):
-        return self.retrieve_policy in {'mass_threshold', 'cumulative_mass'}
+        return self.retrieve_policy in {'mass_threshold', 'cumulative_mass', 'relative_mass', 'relative_coverage'}
+
+    def _is_relative_retrieval(self):
+        return self.retrieve_policy in {'relative_mass', 'relative_coverage'}
 
     def set_dynamic_retrieval_alpha(self, alpha):
-        if not self._is_dynamic_retrieval():
-            raise ValueError('Cannot set dynamic alpha on a fixed retrieval ContextManager.')
+        if not self._is_dynamic_retrieval() or self._is_relative_retrieval():
+            raise ValueError('Cannot set dynamic alpha on a fixed or relative retrieval ContextManager.')
         alpha = float(alpha)
         if not (0.0 < alpha <= 1.0):
             raise ValueError(f'dynamic alpha must be in (0, 1], got {alpha}.')
         self.dynamic_alpha = alpha
         if isinstance(self.retrieve_policy_config, dict):
             self.retrieve_policy_config['alpha'] = alpha
+
+    def set_relative_retrieval_beta(self, beta):
+        if not self._is_relative_retrieval():
+            raise ValueError('Cannot set relative beta on a non-relative retrieval ContextManager.')
+        beta = float(beta)
+        if not (0.0 < beta <= 1.0):
+            raise ValueError(f'relative beta must be in (0, 1], got {beta}.')
+        self.dynamic_beta = beta
+        if isinstance(self.retrieve_policy_config, dict):
+            self.retrieve_policy_config['beta'] = beta
 
     def set_fixed_retrieve_size(self, retrieve_size):
         retrieve_size = int(retrieve_size)
@@ -290,6 +314,7 @@ class ContextManager:
         self.retrieve_policy_config = retrieve_size
         self.retrieve_policy = 'fixed'
         self.dynamic_alpha = None
+        self.dynamic_beta = None
         self.dynamic_normalize = None
         self.dynamic_min_topk = retrieve_size
         self.dynamic_max_topk = retrieve_size
@@ -411,6 +436,8 @@ class ContextManager:
         self.retrieved_block_indices = None
         self.last_selected_topk = None
         self.last_selected_mass = None
+        self.last_relative_reference_mass = None
+        self.last_relative_target_mass = None
         self.to_retrieve = False
 
     def set_retrieved_block_indices(self, retrieved_block_indices):
@@ -543,15 +570,25 @@ class ContextManager:
         probs = self._normalize_retrieval_logits(chunked_logits)
         sorted_probs, sorted_indices = torch.sort(probs, dim=1, descending=True)
         cumulative = sorted_probs.cumsum(dim=1)
-        reached = cumulative >= self.dynamic_alpha
+        min_units = min(max(1, self.dynamic_min_topk // self.chunk_size), sorted_probs.size(1))
+        max_units = min(max(min_units, self.dynamic_max_topk // self.chunk_size), sorted_probs.size(1))
+
+        if self._is_relative_retrieval():
+            reference_mass = cumulative[:, max_units - 1]
+            target = reference_mass * self.dynamic_beta
+            reached = cumulative >= target[:, None]
+            self.last_relative_reference_mass = [float(x.item()) for x in reference_mass]
+            self.last_relative_target_mass = [float(x.item()) for x in target]
+        else:
+            reached = cumulative >= self.dynamic_alpha
+            self.last_relative_reference_mass = None
+            self.last_relative_target_mass = None
+
         fallback = torch.full(
             (self.num_units,), sorted_probs.size(1), dtype=torch.long, device=sorted_probs.device
         )
         first_reached = reached.to(torch.long).argmax(dim=1) + 1
         counts = torch.where(reached.any(dim=1), first_reached, fallback)
-
-        min_units = min(max(1, self.dynamic_min_topk // self.chunk_size), sorted_probs.size(1))
-        max_units = min(max(min_units, self.dynamic_max_topk // self.chunk_size), sorted_probs.size(1))
         counts = counts.clamp(min=min_units, max=max_units)
 
         selected_chunks = []

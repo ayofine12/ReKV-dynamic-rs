@@ -7,7 +7,7 @@ from .dot_production_attention import get_multi_stage_dot_production_attention
 
 
 def is_retrieval_policy(value):
-    return isinstance(value, dict) and value.get('policy') in {'mass_threshold', 'cumulative_mass'}
+    return isinstance(value, dict) and value.get('policy') in {'mass_threshold', 'cumulative_mass', 'relative_mass', 'relative_coverage'}
 
 
 def resolve_layer_value(value, layer_idx):

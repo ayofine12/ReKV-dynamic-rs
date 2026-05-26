@@ -76,6 +76,11 @@ class BaseVQA:
                  dynamic_retrieve_max_size=None,
                  dynamic_retrieve_normalize='zscore_softmax',
                  dynamic_retrieve_alphas=None,
+                 relative_retrieve_beta=None,
+                 relative_retrieve_min_size=None,
+                 relative_retrieve_max_size=None,
+                 relative_retrieve_normalize='zscore_softmax',
+                 relative_retrieve_betas=None,
                  retrieve_sizes=None,
                  save_retrieval_logits=False) -> None:
         
@@ -94,6 +99,11 @@ class BaseVQA:
         self.dynamic_retrieve_max_size = dynamic_retrieve_max_size
         self.dynamic_retrieve_normalize = dynamic_retrieve_normalize
         self.dynamic_retrieve_alphas = dynamic_retrieve_alphas or []
+        self.relative_retrieve_beta = relative_retrieve_beta
+        self.relative_retrieve_min_size = relative_retrieve_min_size
+        self.relative_retrieve_max_size = relative_retrieve_max_size
+        self.relative_retrieve_normalize = relative_retrieve_normalize
+        self.relative_retrieve_betas = relative_retrieve_betas or []
         self.retrieve_sizes = retrieve_sizes or []
 
         self.num_chunks = num_chunks
@@ -115,6 +125,8 @@ class BaseVQA:
             'retrieve_size', 'chunk_size', 'layer_retrieve_sizes',
             'dynamic_retrieve_alpha', 'dynamic_retrieve_min_size',
             'dynamic_retrieve_max_size', 'dynamic_retrieve_normalize',
+            'relative_retrieve_beta', 'relative_retrieve_min_size',
+            'relative_retrieve_max_size', 'relative_retrieve_normalize',
         ]
 
     def split_list(self, lst, n):
@@ -143,6 +155,12 @@ class BaseVQA:
     def get_retrieve_size_save_dir(self, retrieve_size):
         return os.path.join(self.save_dir, f'rs{int(retrieve_size)}-{self.sample_fps}')
 
+    def _beta_label(self, beta):
+        return str(beta).replace('.', 'p')
+
+    def get_beta_save_dir(self, beta):
+        return os.path.join(self.save_dir, f'beta{self._beta_label(beta)}-{self.sample_fps}')
+
     def set_active_dynamic_alpha(self, alpha):
         alpha = float(alpha)
         self.dynamic_retrieve_alpha = alpha
@@ -150,6 +168,16 @@ class BaseVQA:
             self.qa_model.set_dynamic_retrieval_alpha(alpha)
         if self.dynamic_retrieve_alphas:
             self._active_save_dir = self.get_alpha_save_dir(alpha)
+            os.makedirs(self._active_save_dir, exist_ok=True)
+            self.output_csv_path = os.path.join(self._active_save_dir, f'{self.num_chunks}_{self.chunk_idx}.csv')
+
+    def set_active_relative_beta(self, beta):
+        beta = float(beta)
+        self.relative_retrieve_beta = beta
+        if hasattr(self.qa_model, 'set_relative_retrieval_beta'):
+            self.qa_model.set_relative_retrieval_beta(beta)
+        if self.relative_retrieve_betas:
+            self._active_save_dir = self.get_beta_save_dir(beta)
             os.makedirs(self._active_save_dir, exist_ok=True)
             self.output_csv_path = os.path.join(self._active_save_dir, f'{self.num_chunks}_{self.chunk_idx}.csv')
 
@@ -167,6 +195,14 @@ class BaseVQA:
         if self.retrieve_sizes:
             for retrieve_size in self.retrieve_sizes:
                 run_dir = self.get_retrieve_size_save_dir(retrieve_size)
+                os.makedirs(run_dir, exist_ok=True)
+                csv_path = os.path.join(run_dir, f'{self.num_chunks}_{self.chunk_idx}.csv')
+                if os.path.exists(csv_path):
+                    os.remove(csv_path)
+            return
+        if self.relative_retrieve_betas:
+            for beta in self.relative_retrieve_betas:
+                run_dir = self.get_beta_save_dir(beta)
                 os.makedirs(run_dir, exist_ok=True)
                 csv_path = os.path.join(run_dir, f'{self.num_chunks}_{self.chunk_idx}.csv')
                 if os.path.exists(csv_path):
@@ -233,6 +269,10 @@ class BaseVQA:
         row['dynamic_retrieve_min_size'] = self.dynamic_retrieve_min_size
         row['dynamic_retrieve_max_size'] = self.dynamic_retrieve_max_size
         row['dynamic_retrieve_normalize'] = self.dynamic_retrieve_normalize
+        row['relative_retrieve_beta'] = self.relative_retrieve_beta
+        row['relative_retrieve_min_size'] = self.relative_retrieve_min_size
+        row['relative_retrieve_max_size'] = self.relative_retrieve_max_size
+        row['relative_retrieve_normalize'] = self.relative_retrieve_normalize
         self.record.setdefault((self.retrieve_size, self.chunk_size), []).append(row)
 
         stream_row = {col: row.get(col, '') for col in self.stream_result_columns}
@@ -243,6 +283,10 @@ class BaseVQA:
         stream_row['dynamic_retrieve_min_size'] = self.dynamic_retrieve_min_size
         stream_row['dynamic_retrieve_max_size'] = self.dynamic_retrieve_max_size
         stream_row['dynamic_retrieve_normalize'] = self.dynamic_retrieve_normalize
+        stream_row['relative_retrieve_beta'] = self.relative_retrieve_beta
+        stream_row['relative_retrieve_min_size'] = self.relative_retrieve_min_size
+        stream_row['relative_retrieve_max_size'] = self.relative_retrieve_max_size
+        stream_row['relative_retrieve_normalize'] = self.relative_retrieve_normalize
 
         file_exists = os.path.exists(self.output_csv_path)
         with open(self.output_csv_path, 'a', newline='') as f:
@@ -283,6 +327,14 @@ class BaseVQA:
                 df['dynamic_retrieve_max_size'] = self.dynamic_retrieve_max_size
             if 'dynamic_retrieve_normalize' not in df.columns:
                 df['dynamic_retrieve_normalize'] = self.dynamic_retrieve_normalize
+            if 'relative_retrieve_beta' not in df.columns:
+                df['relative_retrieve_beta'] = self.relative_retrieve_beta
+            if 'relative_retrieve_min_size' not in df.columns:
+                df['relative_retrieve_min_size'] = self.relative_retrieve_min_size
+            if 'relative_retrieve_max_size' not in df.columns:
+                df['relative_retrieve_max_size'] = self.relative_retrieve_max_size
+            if 'relative_retrieve_normalize' not in df.columns:
+                df['relative_retrieve_normalize'] = self.relative_retrieve_normalize
             dfs.append(df)
         final_df = pd.concat(dfs, ignore_index=True)
         final_df.to_csv(f'{self.save_dir}/{self.num_chunks}_{self.chunk_idx}.csv', index=False)
@@ -325,6 +377,17 @@ def parse_dynamic_retrieve_alphas(spec):
         if not (0.0 < alpha <= 1.0):
             raise argparse.ArgumentTypeError(f"dynamic alpha must be in (0, 1], got {alpha}.")
     return alphas
+
+
+def parse_relative_retrieve_betas(spec):
+    if spec is None or str(spec).strip() == '':
+        return []
+    pieces = str(spec).replace(',', ' ').split()
+    betas = [float(piece) for piece in pieces]
+    for beta in betas:
+        if not (0.0 < beta <= 1.0):
+            raise argparse.ArgumentTypeError(f"relative beta must be in (0, 1], got {beta}.")
+    return betas
 
 
 def parse_retrieve_sizes(spec):
@@ -372,6 +435,40 @@ def build_dynamic_retrieve_policy(args):
     }
 
 
+def build_relative_retrieve_policy(args):
+    if args.relative_retrieve_beta is None:
+        return None
+
+    min_size = args.relative_retrieve_min_size
+    if min_size is None:
+        min_size = args.retrieve_chunk_size
+    max_size = args.relative_retrieve_max_size
+    if max_size is None:
+        max_size = args.retrieve_size
+
+    min_size = int(min_size)
+    max_size = int(max_size)
+    beta = float(args.relative_retrieve_beta)
+    if min_size <= 0 or max_size <= 0:
+        raise ValueError(f"relative retrieve sizes must be positive, got min={min_size}, max={max_size}.")
+    if min_size > max_size:
+        raise ValueError(f"relative min size {min_size} must be <= max size {max_size}.")
+    if not (0.0 < beta <= 1.0):
+        raise ValueError(f"relative beta must be in (0, 1], got {beta}.")
+    if min_size % args.retrieve_chunk_size != 0 or max_size % args.retrieve_chunk_size != 0:
+        raise ValueError(
+            f"relative min/max sizes must be divisible by retrieve_chunk_size={args.retrieve_chunk_size}."
+        )
+
+    return {
+        'policy': 'relative_mass',
+        'beta': beta,
+        'min_topk': min_size,
+        'max_topk': max_size,
+        'normalize': args.relative_retrieve_normalize,
+    }
+
+
 def str2bool(value):
     if isinstance(value, bool):
         return value
@@ -402,6 +499,17 @@ def work(QA_CLASS):
                         help="Enable cumulative-mass dynamic retrieval with this alpha threshold.")
     parser.add_argument("--dynamic_retrieve_alphas", type=str, default=None,
                         help="Run multiple dynamic alpha values in one video-encoding pass, e.g. '0.2 0.25 0.3 0.35'.")
+    parser.add_argument("--relative_retrieve_beta", type=float, default=None,
+                        help="Enable relative-mass retrieval with this beta coverage of top max-rs mass.")
+    parser.add_argument("--relative_retrieve_betas", type=str, default=None,
+                        help="Run multiple relative beta values in one video-encoding pass, e.g. '0.5 0.6 0.7 0.8'.")
+    parser.add_argument("--relative_retrieve_min_size", type=int, default=None,
+                        help="Minimum number of blocks retrieved per layer when relative retrieval is enabled.")
+    parser.add_argument("--relative_retrieve_max_size", type=int, default=None,
+                        help="Maximum number of blocks used as the relative reference. Defaults to --retrieve_size.")
+    parser.add_argument("--relative_retrieve_normalize", type=str, default='zscore_softmax',
+                        choices=['zscore_softmax', 'softmax', 'minmax_l1', 'relu_l1'],
+                        help="Normalization used before relative-mass retrieval.")
     parser.add_argument("--dynamic_retrieve_min_size", type=int, default=None,
                         help="Minimum number of blocks retrieved per layer when dynamic retrieval is enabled.")
     parser.add_argument("--dynamic_retrieve_max_size", type=int, default=None,
@@ -425,24 +533,40 @@ def work(QA_CLASS):
     except argparse.ArgumentTypeError as exc:
         parser.error(str(exc))
     try:
+        relative_retrieve_betas = parse_relative_retrieve_betas(args.relative_retrieve_betas)
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
+    try:
         retrieve_sizes = parse_retrieve_sizes(args.retrieve_sizes)
     except argparse.ArgumentTypeError as exc:
         parser.error(str(exc))
-    if retrieve_sizes and dynamic_retrieve_alphas:
-        parser.error("Use either --retrieve_sizes or --dynamic_retrieve_alphas, not both.")
-    if retrieve_sizes and args.dynamic_retrieve_alpha is not None:
-        parser.error("Use either --retrieve_sizes or --dynamic_retrieve_alpha, not both.")
+
+    active_modes = sum(bool(x) for x in [
+        retrieve_sizes, dynamic_retrieve_alphas, relative_retrieve_betas,
+        args.dynamic_retrieve_alpha is not None, args.relative_retrieve_beta is not None,
+    ])
+    if active_modes > 1:
+        parser.error(
+            "Use only one retrieval mode among --retrieve_sizes, --dynamic_retrieve_alpha(s), "
+            "and --relative_retrieve_beta(s)."
+        )
     if dynamic_retrieve_alphas:
         if args.dynamic_retrieve_alpha is not None:
             parser.error("Use either --dynamic_retrieve_alpha or --dynamic_retrieve_alphas, not both.")
         args.dynamic_retrieve_alpha = dynamic_retrieve_alphas[0]
+    if relative_retrieve_betas:
+        args.relative_retrieve_beta = relative_retrieve_betas[0]
     try:
         dynamic_retrieve_policy = build_dynamic_retrieve_policy(args)
     except ValueError as exc:
         parser.error(str(exc))
-    if dynamic_retrieve_policy is not None and layer_retrieve_sizes is not None:
-        parser.error("--dynamic_retrieve_alpha and --layer_retrieve_sizes are currently mutually exclusive.")
-    retrieval_topk = dynamic_retrieve_policy or layer_retrieve_sizes or (max(retrieve_sizes) if retrieve_sizes else args.retrieve_size)
+    try:
+        relative_retrieve_policy = build_relative_retrieve_policy(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if (dynamic_retrieve_policy is not None or relative_retrieve_policy is not None) and layer_retrieve_sizes is not None:
+        parser.error("Dynamic/relative retrieval and --layer_retrieve_sizes are currently mutually exclusive.")
+    retrieval_topk = relative_retrieve_policy or dynamic_retrieve_policy or layer_retrieve_sizes or (max(retrieve_sizes) if retrieve_sizes else args.retrieve_size)
 
     # fix random seed
     random.seed(2024)
@@ -477,6 +601,11 @@ def work(QA_CLASS):
         dynamic_retrieve_max_size=(dynamic_retrieve_policy or {}).get('max_topk'),
         dynamic_retrieve_normalize=args.dynamic_retrieve_normalize,
         dynamic_retrieve_alphas=dynamic_retrieve_alphas,
+        relative_retrieve_beta=args.relative_retrieve_beta,
+        relative_retrieve_min_size=(relative_retrieve_policy or {}).get('min_topk'),
+        relative_retrieve_max_size=(relative_retrieve_policy or {}).get('max_topk'),
+        relative_retrieve_normalize=args.relative_retrieve_normalize,
+        relative_retrieve_betas=relative_retrieve_betas,
         retrieve_sizes=retrieve_sizes,
         num_chunks=args.num_chunks,
         chunk_idx=args.chunk_idx,

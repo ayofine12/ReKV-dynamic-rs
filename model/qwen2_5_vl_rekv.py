@@ -15,7 +15,7 @@ from model.patch import patch_hf
 
 
 def is_retrieval_policy(topk):
-    return isinstance(topk, dict) and topk.get('policy') in {'mass_threshold', 'cumulative_mass'}
+    return isinstance(topk, dict) and topk.get('policy') in {'mass_threshold', 'cumulative_mass', 'relative_mass', 'relative_coverage'}
 
 
 def max_topk_value(topk):

@@ -37,6 +37,12 @@ class ReKVOfflineVQA(BaseVQA):
                 f"_min{self.dynamic_retrieve_min_size}"
                 f"_max{self.dynamic_retrieve_max_size}"
             )
+        if getattr(self, 'relative_retrieve_beta', None) is not None:
+            rs_label += (
+                f"_relmass_b{self.relative_retrieve_beta}"
+                f"_min{self.relative_retrieve_min_size}"
+                f"_max{self.relative_retrieve_max_size}"
+            )
         out_dir = Path(getattr(self, '_active_save_dir', self.save_dir)) / 'retrieval_logits' / rs_label
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{self._safe_path_part(video_id)}_{self._safe_path_part(uid)}.pt"
@@ -54,6 +60,10 @@ class ReKVOfflineVQA(BaseVQA):
             'dynamic_retrieve_min_size': getattr(self, 'dynamic_retrieve_min_size', None),
             'dynamic_retrieve_max_size': getattr(self, 'dynamic_retrieve_max_size', None),
             'dynamic_retrieve_normalize': getattr(self, 'dynamic_retrieve_normalize', None),
+            'relative_retrieve_beta': getattr(self, 'relative_retrieve_beta', None),
+            'relative_retrieve_min_size': getattr(self, 'relative_retrieve_min_size', None),
+            'relative_retrieve_max_size': getattr(self, 'relative_retrieve_max_size', None),
+            'relative_retrieve_normalize': getattr(self, 'relative_retrieve_normalize', None),
             'retrieval': payload,
         }, out_path)
         return str(out_path)
@@ -136,6 +146,12 @@ class ReKVOfflineVQA(BaseVQA):
             if self.retrieve_sizes:
                 for retrieve_size in self.retrieve_sizes:
                     self.set_active_retrieve_size(retrieve_size)
+                    self._answer_sample(video_sample, sample)
+                continue
+
+            if self.relative_retrieve_betas:
+                for beta in self.relative_retrieve_betas:
+                    self.set_active_relative_beta(beta)
                     self._answer_sample(video_sample, sample)
                 continue
 
